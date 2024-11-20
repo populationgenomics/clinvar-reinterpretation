@@ -29,4 +29,4 @@ def test_consequence_decision_path_single(
         sub = deepcopy(BASIC_SUB)
         sub.classification = con
         all_subs.append(sub)
-    assert consequence_decision(all_subs) == expected
+    assert consequence_decision(all_subs, False) == expected

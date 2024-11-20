@@ -24,7 +24,7 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from collections.abc import Generator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 
 import hail as hl
@@ -52,6 +52,7 @@ ORDERED_ALLELES: list[str] = [f'chr{x}' for x in list(range(1, 23))] + ['chrX', 
 
 # I really want the linter to just tolerate naive datetimes, but it won't
 TIMEZONE = zoneinfo.ZoneInfo('Australia/Brisbane')
+TODAY = datetime.now().replace(tzinfo=TIMEZONE).date()
 
 # published Nov 2015, available pre-print since March 2015
 # assumed to be influential since 2016
@@ -93,6 +94,27 @@ class Submission:
     submitter: str
     classification: Consequence
     review_status: str
+
+    @property
+    def weighted_score(self) -> int:
+        """
+        Calculate a weighted score based on the difference between the submission date and today's date.
+
+        Returns:
+            The weighted score between 5 and 1.
+        """
+        difference = (TODAY - self.date.date()).days / 365
+
+        if difference < 1:
+            return 5
+        elif difference < 2:
+            return 4
+        elif difference < 3:
+            return 3
+        elif difference < 4:
+            return 2
+        else:
+            return 1
 
 
 def get_allele_locus_map(summary_file: str) -> dict:
@@ -169,7 +191,7 @@ def lines_from_gzip(filename: str) -> Generator[list[str], None, None]:
             yield line.rstrip().split('\t')
 
 
-def consequence_decision(subs: list[Submission]) -> Consequence:
+def consequence_decision(subs: list[Submission], weight_by_submission_age: bool) -> Consequence:
     """
     determine overall consequence assignment based on submissions
 
@@ -191,9 +213,16 @@ def consequence_decision(subs: list[Submission]) -> Consequence:
         if each_sub.review_status in STRONG_REVIEWS:
             return each_sub.classification
 
-        counts['total'] += 1
+        if weight_by_submission_age:
+            counts['total'] += each_sub.weighted_score
+        else:
+            counts['total'] += 1
+
         if each_sub.classification in [Consequence.PATHOGENIC, Consequence.BENIGN, Consequence.UNCERTAIN]:
-            counts[each_sub.classification] += 1
+            if weight_by_submission_age:
+                counts[each_sub.classification] += each_sub.weighted_score
+            else:
+                counts[each_sub.classification] += 1
 
     if counts[Consequence.PATHOGENIC] and counts[Consequence.BENIGN]:
         if (max(counts[Consequence.PATHOGENIC], counts[Consequence.BENIGN]) >= (counts['total'] * MAJORITY_RATIO)) and (
@@ -480,6 +509,11 @@ def cli_main():
     parser.add_argument('-o', help='output root, for table, json, and path-only VCF', required=True)
     parser.add_argument('--minimal', help='only keep path. and 1+ star benign', action='store_true')
     parser.add_argument('-b', help='sites to blacklist', nargs='+', default=[])
+    parser.add_argument(
+        '--weight_by_submission_age',
+        help='weight submissions by age of submission',
+        action='store_true',
+    )
     args = parser.parse_args()
 
     # if sites are blacklisted on the CLI, update the global BLACKLIST value
@@ -487,7 +521,7 @@ def cli_main():
     if args.b:
         BLACKLIST.update(args.b)
 
-    main(subs=args.s, variants=args.v, output_root=args.o, minimal=args.minimal)
+    main(subs=args.s, variants=args.v, output_root=args.o, minimal=args.minimal, weight_by_submission_age=args.weight_by_submission_age)
 
 
 def only_keep_talos_relevant_entries(results: list[dict]) -> list[dict]:
@@ -510,7 +544,7 @@ def only_keep_talos_relevant_entries(results: list[dict]) -> list[dict]:
     ]
 
 
-def main(subs: str, variants: str, output_root: str, minimal: bool):
+def main(subs: str, variants: str, output_root: str, minimal: bool, weight_by_submission_age: bool):
     """
     Redefines what it is to be a clinvar summary
 
@@ -519,6 +553,7 @@ def main(subs: str, variants: str, output_root: str, minimal: bool):
         variants (str): file path to variant summary (gzipped)
         output_root (str): path to write JSON out to
         minimal (bool): only keep the talos-relevant entries
+        weighted_by_submission_age (bool): weight submissions by age of submission
     """
 
     logging.info('Getting alleleID-VariantID-Loci from variant summary')
@@ -542,7 +577,7 @@ def main(subs: str, variants: str, output_root: str, minimal: bool):
         if not filtered_submissions:
             rating = Consequence.UNCERTAIN
         else:
-            rating = consequence_decision(filtered_submissions)
+            rating = consequence_decision(filtered_submissions, weight_by_submission_age)
 
         # assess stars in remaining entries
         stars = check_stars(filtered_submissions)
