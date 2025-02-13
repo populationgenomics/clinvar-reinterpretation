@@ -58,11 +58,11 @@ At this stage we have each allele with a summary and star rating. The allele ID 
   * This step is not addressed by this repository, but is a necessary step to generate the PM5 annotations
 
 * PM5 Re-Index
-  * Iterate over all variants in the VCF, identifying all missense variants and their affected protein residues
+  * Iterate over all variants in the VCF, identifying all missense variants and their affected codon
   * Collect a lookup of the ClinVar entries which are relevant to each residue
   * This creates data approximating this format in both JSON and Hail Table forms:
 
 | Residue affected | ClinVar Alleles                   |
 |------------------|-----------------------------------|
-| ENSP12345::123   | AlleleID::#Stars                  |
-| ENSP12345::678   | AlleleID::#Stars+AlleleID::#Stars |
+| ENST12345::123   | AlleleID::#Stars                  |
+| ENST12345::678   | AlleleID::#Stars+AlleleID::#Stars |

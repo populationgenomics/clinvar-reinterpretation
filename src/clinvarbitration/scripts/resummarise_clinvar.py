@@ -31,6 +31,9 @@ import hail as hl
 import pandas as pd
 import zoneinfo
 
+ASSEMBLY = 'Assembly'
+GRCH37 = 'GRCh37'
+GRCH38 = 'GRCh38'
 BENIGN_SIGS = {'Benign', 'Likely benign', 'Benign/Likely benign', 'protective'}
 CONFLICTING = 'conflicting data from submitters'
 PATH_SIGS = {
@@ -48,7 +51,10 @@ USELESS_RATINGS: set[str] = set()
 MAJORITY_RATIO: float = 0.6
 MINORITY_RATIO: float = 0.2
 STRONG_REVIEWS: list[str] = ['practice guideline', 'reviewed by expert panel']
-ORDERED_ALLELES: list[str] = [f'chr{x}' for x in list(range(1, 23))] + ['chrX', 'chrY', 'chrM']
+ORDERED_ALLELES: dict[str, list[str]] = {
+    GRCH38: [f'chr{x}' for x in list(range(1, 23))] + ['chrX', 'chrY', 'chrM'],
+    GRCH37: [*list(map(str, range(1, 23))), 'X', 'Y', 'MT'],
+}
 
 # I really want the linter to just tolerate naive datetimes, but it won't
 TIMEZONE = zoneinfo.ZoneInfo('Australia/Brisbane')
@@ -95,12 +101,12 @@ class Submission:
     review_status: str
 
 
-def get_allele_locus_map(summary_file: str) -> dict:
+def get_allele_locus_map(summary_file: str, assembly: str) -> dict:
     """
     Process variant_summary.txt
      - links the allele ID, Locus/Alleles, and variant ID
     relevant fields:
-    0 #AlleleID
+    0 AlleleID
     20 Chromosome
     30 VariationID
     31 Start
@@ -109,6 +115,7 @@ def get_allele_locus_map(summary_file: str) -> dict:
 
     Args:
         summary_file (str): path to the gzipped text file
+        assembly (str): genome build to use
 
     Returns:
         dictionary of each variant ID to the positional details
@@ -116,26 +123,31 @@ def get_allele_locus_map(summary_file: str) -> dict:
 
     allele_dict = {}
 
-    for line in lines_from_gzip(summary_file):
-        if 'GRCh37' in line:
+    for line in dicts_from_gzip(summary_file):
+        if line[ASSEMBLY] != assembly:
             continue
 
-        # pull values from the line
-        allele_id = int(line[0])
-        chromosome = line[18] if 'chr' in line[18] else f'chr{line[18]}'
-        var_id = int(line[30])
-        uniq_var_id = f'{chromosome}_{line[30]}'
-        pos = int(line[31])
-        ref = line[32]
-        alt = line[33]
+        chromosome = f'chr{line["Chromosome"]}' if assembly == GRCH38 else line['Chromosome']
+        ref = line['ReferenceAlleleVCF']
+        alt = line['AlternateAlleleVCF']
+
+        # skip over cytogenetic locations
+        if any(x == 'na' for x in [ref, alt]) or ref == alt:
+            continue
 
         # skip non-standard chromosomes
-        if chromosome not in ORDERED_ALLELES:
+        if chromosome not in ORDERED_ALLELES[assembly]:
             continue
 
         # skip chromosomal deletions and insertions, or massive indels
-        if ref == 'na' or alt == 'na' or ref == alt or (len(ref) + len(alt)) > LARGEST_COMPLEX_INDELS:
+        if len(ref) + len(alt) > LARGEST_COMPLEX_INDELS:
             continue
+
+        # pull values from the line
+        allele_id = int(line['AlleleID'])
+        var_id = int(line['VariationID'])
+        uniq_var_id = f'{chromosome}_{var_id}'
+        pos = int(line['PositionVCF'])
 
         # don't include any of the trash bases in ClinVar
         if BASES.match(ref) and BASES.match(alt):
@@ -151,7 +163,7 @@ def get_allele_locus_map(summary_file: str) -> dict:
     return allele_dict
 
 
-def lines_from_gzip(filename: str) -> Generator[list[str], None, None]:
+def dicts_from_gzip(filename: str) -> Generator[dict[str, str], None, None]:
     """
     generator for gzip reading
 
@@ -159,14 +171,19 @@ def lines_from_gzip(filename: str) -> Generator[list[str], None, None]:
         filename (str): the gzipped input file
 
     Returns:
-        generator; yields each line as a list of its elements
+        generator; yields each line as a dictionary
     """
+
+    # start with an empty list to please the linter
+    header: list[str] = []
 
     with gzip.open(filename, 'rt') as handle:
         for line in handle:
             if line.startswith('#'):
+                header = line[1:].rstrip().split('\t')
                 continue
-            yield line.rstrip().split('\t')
+
+            yield dict(zip(header, line.rstrip().split('\t'), strict=True))
 
 
 def consequence_decision(subs: list[Submission]) -> Consequence:
@@ -253,9 +270,14 @@ def check_stars(subs: list[Submission]) -> int:
     return minimum
 
 
-def process_submission_line(data: list[str]) -> tuple[int, Submission]:
+def process_submission_line(data: dict[str, str]) -> tuple[int, Submission]:
     """
-    takes a line, strips out useful content as a 'Submission'
+    takes a line, strips out useful content as a 'Submission'. Relevant fields:
+    #VariationID
+    ClinicalSignificance
+    DateLastEvaluated
+    ReviewStatus
+    Submitter
 
     Args:
         data (): the array of line content
@@ -263,18 +285,22 @@ def process_submission_line(data: list[str]) -> tuple[int, Submission]:
     Returns:
         the allele ID and corresponding Submission details
     """
-    var_id = int(data[0])
-    if data[1] in PATH_SIGS:
+    var_id = int(data['VariationID'])
+    if data['ClinicalSignificance'] in PATH_SIGS:
         classification = Consequence.PATHOGENIC
-    elif data[1] in BENIGN_SIGS:
+    elif data['ClinicalSignificance'] in BENIGN_SIGS:
         classification = Consequence.BENIGN
-    elif data[1] in UNCERTAIN_SIGS:
+    elif data['ClinicalSignificance'] in UNCERTAIN_SIGS:
         classification = Consequence.UNCERTAIN
     else:
         classification = Consequence.UNKNOWN
-    date = datetime.strptime(data[2], '%b %d, %Y').replace(tzinfo=TIMEZONE) if data[2] != '-' else VERY_OLD
-    sub = data[9].lower()
-    rev_status = data[6].lower()
+    date = (
+        datetime.strptime(data['DateLastEvaluated'], '%b %d, %Y').replace(tzinfo=TIMEZONE)
+        if data['DateLastEvaluated'] != '-'
+        else VERY_OLD
+    )
+    sub = data['Submitter'].lower()
+    rev_status = data['ReviewStatus'].lower()
 
     return var_id, Submission(date, sub, classification, rev_status)
 
@@ -313,7 +339,7 @@ def get_all_decisions(submission_file: str, var_ids: set[int]) -> dict[int, list
 
     submission_dict = defaultdict(list)
 
-    for line in lines_from_gzip(submission_file):
+    for line in dicts_from_gzip(submission_file):
         var_id, line_sub = process_submission_line(line)
 
         # skip rows where the variantID isn't in this mapping
@@ -362,21 +388,22 @@ def acmg_filter_submissions(subs: list[Submission]) -> list[Submission]:
     return date_filt_subs or subs
 
 
-def sort_decisions(all_subs: list[dict]) -> list[dict]:
+def sort_decisions(all_subs: list[dict], assembly: str) -> list[dict]:
     """
     applies dual-layer sorting to the list of all decisions
 
     Args:
         all_subs (): list of all submissions
+        assembly (): genome build to use
 
     Returns:
         a list of submissions, sorted hierarchically on chr & pos
     """
 
-    return sorted(all_subs, key=lambda x: (ORDERED_ALLELES.index(x['contig']), x['position']))
+    return sorted(all_subs, key=lambda x: (ORDERED_ALLELES[assembly].index(x['contig']), x['position']))
 
 
-def parse_into_table(json_path: str, out_path: str) -> hl.Table:
+def parse_into_table(json_path: str, out_path: str, assembly: str) -> hl.Table:
     """
     takes the file of one clinvar variant per line
     processes that line into a table based on the schema
@@ -384,13 +411,14 @@ def parse_into_table(json_path: str, out_path: str) -> hl.Table:
     Args:
         json_path (str): path to the JSON file (temp)
         out_path (str): where to write the Hail table
+        assembly (str): genome build to use
 
     Returns:
         the Hail Table object created
     """
 
     # start a hail runtime
-    hl.context.init_local(default_reference='GRCh38')
+    hl.context.init_local(default_reference=assembly)
 
     # define the schema for each written line
     schema = hl.dtype(
@@ -427,18 +455,8 @@ def write_vep_vcf(clinvar_table: hl.Table, output_root: str):
         clinvar_table (hl.Table): the table of re-summarised clinvar loci
         output_root (str): Path to write files to
     """
-
-    # persist the relevant clinvar annotations in INFO
-    clinvar_table = clinvar_table.transmute(
-        info=hl.struct(
-            allele_id=clinvar_table.allele_id,
-            gold_stars=clinvar_table.gold_stars,
-            clinical_significance=clinvar_table.clinical_significance,
-        ),
-    )
-
     # export this data in VCF format
-    vcf_path = f'{output_root}_for_VEP.vcf.bgz'
+    vcf_path = f'{output_root}_unfiltered.vcf.bgz'
     hl.export_vcf(clinvar_table, vcf_path, tabix=True)
     logging.info(f'Wrote VCF to {vcf_path}')
 
@@ -460,12 +478,7 @@ def snv_missense_filter(clinvar_table: hl.Table, output_root: str):
     clinvar_table = clinvar_table.filter(
         (hl.len(clinvar_table.alleles[0]) == 1)
         & (hl.len(clinvar_table.alleles[1]) == 1)
-        & (clinvar_table.clinical_significance == Consequence.PATHOGENIC.value),
-    )
-
-    # persist the clinvar annotations in an INFO field
-    clinvar_table = clinvar_table.annotate(
-        info=hl.struct(allele_id=clinvar_table.allele_id, gold_stars=clinvar_table.gold_stars),
+        & (clinvar_table.info.clinical_significance == Consequence.PATHOGENIC.value),
     )
 
     # export this data in VCF format
@@ -476,12 +489,40 @@ def snv_missense_filter(clinvar_table: hl.Table, output_root: str):
 
 def cli_main():
     logging.basicConfig(level=logging.INFO)
-    parser = ArgumentParser()
-    parser.add_argument('-s', help='submission_summary.txt.gz from NCBI', required=True)
-    parser.add_argument('-v', help='variant_summary.txt.gz from NCBI', required=True)
-    parser.add_argument('-o', help='output root, for table, json, and path-only VCF', required=True)
-    parser.add_argument('--minimal', help='only keep path. and 1+ star benign', action='store_true')
-    parser.add_argument('-b', help='sites to blacklist', nargs='+', default=[])
+    parser = ArgumentParser(description='Generates a new clinVar summary from raw submission data')
+    parser.add_argument(
+        '-s',
+        help='submission_summary.txt.gz from NCBI',
+        required=True,
+    )
+    parser.add_argument(
+        '-v',
+        help='variant_summary.txt.gz from NCBI',
+        required=True,
+    )
+    parser.add_argument(
+        '-o',
+        help='output root, for table, json, and path-only VCF',
+        required=True,
+    )
+    parser.add_argument(
+        '--minimal',
+        help='only keep path. and 1+ star benign',
+        action='store_true',
+    )
+    parser.add_argument(
+        '-b',
+        help='sites to blacklist',
+        nargs='+',
+        default=[],
+    )
+    parser.add_argument(
+        '--assembly',
+        help='genome build to use',
+        default='GRCh38',
+        choices=[GRCH37, GRCH38],
+    )
+
     args = parser.parse_args()
 
     # if sites are blacklisted on the CLI, update the global BLACKLIST value
@@ -489,7 +530,7 @@ def cli_main():
     if args.b:
         BLACKLIST.update(args.b)
 
-    main(subs=args.s, variants=args.v, output_root=args.o, minimal=args.minimal)
+    main(subs=args.s, variants=args.v, output_root=args.o, minimal=args.minimal, assembly=args.assembly)
 
 
 def only_keep_talos_relevant_entries(results: list[dict]) -> list[dict]:
@@ -512,7 +553,7 @@ def only_keep_talos_relevant_entries(results: list[dict]) -> list[dict]:
     ]
 
 
-def main(subs: str, variants: str, output_root: str, minimal: bool):
+def main(subs: str, variants: str, output_root: str, minimal: bool, assembly: str):
     """
     Redefines what it is to be a clinvar summary
 
@@ -521,10 +562,11 @@ def main(subs: str, variants: str, output_root: str, minimal: bool):
         variants (str): file path to variant summary (gzipped)
         output_root (str): path to write JSON out to
         minimal (bool): only keep the talos-relevant entries
+        assembly (str): genome build to use
     """
 
     logging.info('Getting alleleID-VariantID-Loci from variant summary')
-    allele_map = get_allele_locus_map(variants)
+    allele_map = get_allele_locus_map(variants, assembly)
 
     logging.info('Getting all decisions, indexed on clinvar Var ID')
 
@@ -541,10 +583,7 @@ def main(subs: str, variants: str, output_root: str, minimal: bool):
         filtered_submissions = acmg_filter_submissions(submissions)
 
         # obtain an aggregate rating
-        if not filtered_submissions:
-            rating = Consequence.UNCERTAIN
-        else:
-            rating = consequence_decision(filtered_submissions)
+        rating = Consequence.UNCERTAIN if not filtered_submissions else consequence_decision(filtered_submissions)
 
         # assess stars in remaining entries
         stars = check_stars(filtered_submissions)
@@ -585,7 +624,7 @@ def main(subs: str, variants: str, output_root: str, minimal: bool):
     logging.info(f'{len(complete_decisions)} ClinVar entries remain')
 
     # sort all collected decisions, trying to reduce overhead in HT later
-    complete_decisions_sorted = sort_decisions(complete_decisions)
+    complete_decisions_sorted = sort_decisions(complete_decisions, assembly=assembly)
 
     # write out the JSON version of these results
     json_output = f'{output_root}.json'
@@ -598,7 +637,16 @@ def main(subs: str, variants: str, output_root: str, minimal: bool):
             handle.write(f'{json.dumps(each_dict)}\n')
 
     logging.info('JSON written to file, parsing into a Hail Table')
-    ht = parse_into_table(json_path=json_output, out_path=output_root)
+    ht = parse_into_table(json_path=json_output, out_path=output_root, assembly=assembly)
+
+    # persist the relevant clinvar annotations in INFO
+    ht = ht.transmute(
+        info=hl.struct(
+            allele_id=ht.allele_id,
+            gold_stars=ht.gold_stars,
+            clinical_significance=ht.clinical_significance,
+        ),
+    )
 
     # export this table of decisions as a tabix-indexed VCF
     logging.info('Writing out all entries as a VCF')

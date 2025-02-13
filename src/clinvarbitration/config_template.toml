@@ -1,0 +1,39 @@
+[workflow]
+name = 'clinvarbitration'
+
+# CPG-flow requires an input cohort to start up, a dataset to run as, and a permission level
+# usually these would be populated by analysis-runner
+dataset = 'dataset_name'
+access_level = 'test'  # or 'standard'
+
+sequencing_type = 'genome'
+
+# an input cohort is required to get cpg-flow to run
+input_cohorts = ['COHXYZ']
+
+# used to make sure we don't repeat previously completed stages
+check_expected_outputs = true
+
+# the path and tag to the image to use. This is populated by the analysis-runner
+driver_image = 'name_and_tag_for_docker:image'
+
+# if you want to screen out any ClinVar submitters when re-summarising, add them to this list
+# example use cases would be blinding an analysis to your own clinvar submissions
+site_blacklist = []
+
+# genome build, required for bcftools annotation and Hail setup
+# currently only GRCh37 and GRCh38 are supported (including bundled GFF3 files for annotation)
+genome_build = 'GRCh38'
+
+# path to the Fasta file for this analysis, requires for bcftools annotation
+ref_fasta = "path to a fasta file for your chosen genome build"
+
+[storage.common]
+analysis = 'path to output folder'
+
+## If the pipeline is being dry-run locally
+#[hail]
+#billing_project = "test-dataset"
+#delete_scratch_on_exit = true
+#dry_run = true
+#backend = "local"

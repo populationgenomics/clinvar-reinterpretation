@@ -1,4 +1,0 @@
-bump2version
-black
-pre-commit
-pytest

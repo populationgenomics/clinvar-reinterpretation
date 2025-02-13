@@ -1,4 +1,0 @@
-cyvcf2>=0.30.28
-hail>=0.2.128
-pandas>=2.0.3
-pyspark>=3.3.3
